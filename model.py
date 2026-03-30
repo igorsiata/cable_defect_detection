@@ -3,7 +3,7 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 import pickle
-
+from scipy.ndimage import gaussian_filter, zoom
 import numpy as np
 import onnxruntime as ort
 from PIL import Image
@@ -11,13 +11,13 @@ from PIL import Image
 
 BASE_DIR = Path(__file__).resolve().parent
 MODEL_PATH = BASE_DIR / "resnet50_extractor.onnx"
-KNN_PATH = BASE_DIR / "knn_index.pkl"
+KNN_PATH = BASE_DIR / "knn_cable.pkl"
 
 # PatchCore settings.
 INPUT_SIZE = (224, 224)
 PATCH_GRID = (28, 28)
-BEST_THRESHOLD = 20.347673
-PIXEL_THRESHOLD_FACTOR = 1.0
+PIXEL_THRESHOLD = 20.645910
+SPATIAL_COORD_WEIGHT = 10.0
 
 
 @lru_cache(maxsize=1)
@@ -36,6 +36,35 @@ def _load_runtime() -> tuple[ort.InferenceSession, object, str, str]:
     output_name = session.get_outputs()[0].name
     return session, nn_index, input_name, output_name
 
+def _infer_patch_grid(num_patches: int) -> tuple[int, int]:
+    side = int(np.sqrt(num_patches))
+    if side * side != num_patches:
+        raise ValueError(f"Cannot reshape {num_patches} patches to square segmentation map.")
+    return side, side
+
+def _add_spatial_coordinates(features: np.ndarray, weight: float = 5.0) -> np.ndarray:
+    """
+    Dokleja znormalizowane współrzędne 2D do wektorów cech.
+    Oryginalny kształt: (num_patches, channels)
+    Nowy kształt: (num_patches, channels + 2)
+    """
+    num_patches, channels = features.shape
+    grid_h, grid_w = _infer_patch_grid(num_patches)
+    
+    # Tworzymy znormalizowaną siatkę współrzędnych od -1.0 do 1.0
+    y_coords = np.linspace(-1.0, 1.0, grid_h)
+    x_coords = np.linspace(-1.0, 1.0, grid_w)
+    xv, yv = np.meshgrid(x_coords, y_coords)
+    
+    # Spłaszczamy siatkę i łączymy w pary (Y, X)
+    # Kolejność odpowiada spłaszczaniu tensora w Twoim ekstraktorze cech
+    spatial_features = np.stack([yv.flatten(), xv.flatten()], axis=1).astype(np.float32)
+    
+    # Mnożymy przez wagę - to NAJWAŻNIEJSZY hiperparametr!
+    spatial_features *= weight
+    
+    # Doklejamy współrzędne do cech wizualnych
+    return np.concatenate([features, spatial_features], axis=1)
 
 def _to_hwc_uint8(image: np.ndarray) -> np.ndarray:
     """Accept CHW/HWC input and return HWC uint8 RGB."""
@@ -96,13 +125,19 @@ def predict(image: np.ndarray) -> np.ndarray:
     arr = _preprocess_from_array(image_hwc)
 
     features = session.run([output_name], {input_name: arr})[0].astype(np.float32)
+    features = _add_spatial_coordinates(features, weight=SPATIAL_COORD_WEIGHT)
     distances, _ = nn_index.kneighbors(features, n_neighbors=1, return_distance=True)
     dist_score = distances[:, 0]
 
-    # Patch-level anomaly map and threshold to binary segmentation.
-    segm_map = dist_score.reshape(PATCH_GRID)
-    mask_small = segm_map >= (BEST_THRESHOLD * PIXEL_THRESHOLD_FACTOR)
-    mask = _resize_mask_to_original(mask_small, h, w)
+    grid_h, grid_w = _infer_patch_grid(len(dist_score))
+    segm_map = dist_score.reshape((grid_h, grid_w))
+    
+    zoom_factor = (1024 / grid_h, 1024 / grid_w)
+    segm_map_resized = zoom(segm_map, zoom_factor, order=1)
+    # sigma=4.0 lub 8.0 sprawdza się świetnie dla mapy 224x224
+    heat_map = gaussian_filter(segm_map_resized, sigma=8.0)
+    mask = heat_map >= (PIXEL_THRESHOLD)
+    # mask = _resize_mask_to_original(mask_small, h, w)
 
     return mask
 

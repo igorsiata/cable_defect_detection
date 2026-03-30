@@ -6,7 +6,7 @@ from typing import Callable, Dict, Optional, Union
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
-from torchvision.models import ResNet18_Weights, ResNet50_Weights, resnet18, resnet50
+from torchvision.models import ResNet18_Weights, ResNet50_Weights, resnet18, resnet50, wide_resnet50_2, Wide_ResNet50_2_Weights
 
 
 class _ResNetFeatureExtractorBase(nn.Module):
@@ -147,6 +147,65 @@ class _ResNetFeatureExtractorBase(nn.Module):
         return model
 
 
+class ResNet50FeatureExtractorL123(_ResNetFeatureExtractorBase):
+    """ResNet50 extractor that concatenates layer1, layer2 and layer3 features.
+
+    Output spatial resolution follows `layer1` (typically 56x56 for 224x224 input),
+    which improves localization of small defects at the cost of higher memory usage.
+    """
+
+    def __init__(
+        self,
+        pretrained: bool = True,
+        freeze_backbone: bool = True,
+        avg_pool_kernel: int = 3,
+        avg_pool_stride: int = 1,
+        avg_pool_padding: Optional[int] = None,
+    ) -> None:
+        super().__init__(
+            backbone_builder=resnet50,
+            default_weights=ResNet50_Weights.DEFAULT,
+            pretrained=pretrained,
+            freeze_backbone=freeze_backbone,
+            avg_pool_kernel=avg_pool_kernel,
+            avg_pool_stride=avg_pool_stride,
+            avg_pool_padding=avg_pool_padding,
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        def _extract() -> tuple[Tensor, Tensor, Tensor]:
+            out = self.backbone.conv1(x)
+            out = self.backbone.bn1(out)
+            out = self.backbone.relu(out)
+            out = self.backbone.maxpool(out)
+            fmap1 = self.backbone.layer1(out)
+            fmap2 = self.backbone.layer2(fmap1)
+            fmap3 = self.backbone.layer3(fmap2)
+            return fmap1, fmap2, fmap3
+
+        if self.freeze_backbone:
+            with torch.no_grad():
+                fmap1, fmap2, fmap3 = _extract()
+        else:
+            fmap1, fmap2, fmap3 = _extract()
+
+        pooled = [
+            F.avg_pool2d(
+                fmap,
+                self.avg_pool_kernel,
+                stride=self.avg_pool_stride,
+                padding=self.avg_pool_padding,
+            )
+            for fmap in (fmap1, fmap2, fmap3)
+        ]
+        fmap_size = pooled[0].shape[-2:]
+        resized = [F.adaptive_avg_pool2d(fmap, fmap_size) for fmap in pooled]
+
+        patch = torch.cat(resized, dim=1)
+        patch = patch.reshape(patch.shape[1], -1).T
+        return patch
+
+
 class ResNet50FeatureExtractor(_ResNetFeatureExtractorBase):
     def __init__(
         self,
@@ -166,6 +225,24 @@ class ResNet50FeatureExtractor(_ResNetFeatureExtractorBase):
             avg_pool_padding=avg_pool_padding,
         )
 
+class WideResNet50FeatureExtractor(_ResNetFeatureExtractorBase):
+    def __init__(
+        self,
+        pretrained: bool = True,
+        freeze_backbone: bool = True,
+        avg_pool_kernel: int = 3,
+        avg_pool_stride: int = 1,
+        avg_pool_padding: Optional[int] = None,
+    ) -> None:
+        super().__init__(
+            backbone_builder=wide_resnet50_2,
+            default_weights=Wide_ResNet50_2_Weights.DEFAULT,
+            pretrained=pretrained,
+            freeze_backbone=freeze_backbone,
+            avg_pool_kernel=avg_pool_kernel,
+            avg_pool_stride=avg_pool_stride,
+            avg_pool_padding=avg_pool_padding,
+        )
 
 class ResNet18FeatureExtractor(_ResNetFeatureExtractorBase):
     def __init__(
@@ -187,12 +264,12 @@ class ResNet18FeatureExtractor(_ResNetFeatureExtractorBase):
         )
 
 if __name__ == "__main__":
-    model = ResNet18FeatureExtractor(pretrained=True, freeze_backbone=True)
+    model = ResNet50FeatureExtractorL123(pretrained=True, freeze_backbone=True)
     # model.load_state_dict(torch.load("resnet50_extractor_weights.pth", map_location="cpu"))
     model.export_onnx(
-        path="resnet18_extractor.onnx",
+        path="resnet50_l123.onnx",
         input_shape=(1, 3, 224, 224),
-        opset_version=18,
+        opset_version=21,
         dynamic_batch=True,
         dynamic_hw=False,
         # use_external_data_format=False,
