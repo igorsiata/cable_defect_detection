@@ -68,6 +68,40 @@ def preprocess_image(
     arr = np.expand_dims(arr, axis=0)
     return arr
 
+def k_center_greedy(features: np.ndarray, coreset_size: int) -> np.ndarray:
+    """
+    Zachłannie wybiera punkty maksymalizujące pokrycie przestrzeni cech.
+    """
+    n = features.shape[0]
+    if coreset_size >= n:
+        return features
+
+    # 1. Wybieramy pierwszy punkt losowo
+    coreset_idx = [np.random.randint(0, n)]
+    
+    # 2. Tablica minimalnych dystansów od każdego punktu do najbliższego punktu w rdzeniu.
+    # Na starcie ustawiona na nieskończoność.
+    min_distances = np.full(n, np.inf)
+
+    for _ in range(1, coreset_size):
+        # Ostatnio dodany punkt
+        last_added = features[coreset_idx[-1]:coreset_idx[-1]+1]
+        
+        # Obliczamy odległość euklidesową (wersja do kwadratu dla szybkości obliczeń)
+        # od wszystkich punktów do nowo dodanego punktu
+        dists = np.sum((features - last_added) ** 2, axis=1)
+        
+        # Aktualizujemy minimalne odległości (każdy punkt pamięta odległość 
+        # tylko do swojego najbliższego sąsiada z już wybranego coresetu)
+        min_distances = np.minimum(min_distances, dists)
+        
+        # Wybieramy punkt, którego minimalna odległość jest NAJWIĘKSZA
+        # (czyli leży najdalej od wszystkich dotychczas wybranych punktów)
+        next_idx = np.argmax(min_distances)
+        coreset_idx.append(next_idx)
+
+    return features[coreset_idx]
+
 def create_knn_memory_bank(
     session,
     train_dir,
@@ -100,10 +134,11 @@ def create_knn_memory_bank(
     # Global coreset sampling.
     k = max(1, int(len(memory_bank) * coreset_ratio))
     k = min(k, max_patches, len(memory_bank))
-    selected_indices = rng.choice(len(memory_bank), size=k, replace=False)
-    memory_bank = memory_bank[selected_indices]
+    
+    print(f"Redukcja banku pamięci K-Center Greedy do {k} elementów... (To może potrwać kilka sekund)")
+    memory_bank = k_center_greedy(memory_bank, coreset_size=k)
 
-    nn_index = NearestNeighbors(n_neighbors=1, metric="euclidean", algorithm="auto")
+    nn_index = NearestNeighbors(n_neighbors=1, metric="euclidean", algorithm="brute", n_jobs=-1)
     nn_index.fit(memory_bank)
 
     with open(index_path, "wb") as f:
@@ -275,7 +310,7 @@ if __name__ == "__main__":
     model_path = Path("resnet50_extractor.onnx")
     train_dir = Path("/home/igorsiata/studia/algorytmy_wizyjne/cable_defect_detection/dataset/train/good")
     test_dir = Path("/home/igorsiata/studia/algorytmy_wizyjne/cable_defect_detection/dataset/test")
-    coreset_ratio = 0.1
+    coreset_ratio = 0.02
     max_patches = 12000
     max_patches_per_image = 512
     index_path = Path("knn_cable.pkl")
